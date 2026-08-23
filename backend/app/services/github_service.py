@@ -194,6 +194,54 @@ def get_pull_request_diff(
 
         return None
 
+# ============================================================
+# GET FILE CONTENT FROM PULL REQUEST
+# ============================================================
+
+def get_pull_request_file_content(
+    repository_name: str,
+    pull_request_number: int,
+    file_path: str,
+):
+    """
+    Get the actual file content from the Pull Request's
+    source branch.
+    """
+
+    pull_request = get_pull_request(
+        repository_name,
+        pull_request_number,
+    )
+
+    repository = get_repository(
+        repository_name
+    )
+
+    try:
+
+        file_content = repository.get_contents(
+            file_path,
+            ref=pull_request.head.sha,
+        )
+
+        if isinstance(file_content, list):
+            raise RuntimeError(
+                f"'{file_path}' is a directory, not a file."
+            )
+
+        content = file_content.decoded_content.decode(
+            "utf-8"
+        )
+
+        return content
+
+    except GithubException as exc:
+
+        raise RuntimeError(
+            f"Could not retrieve file "
+            f"'{file_path}' from PR "
+            f"#{pull_request_number}: {exc}"
+        ) from exc
 
 # ============================================================
 # TEST GITHUB CONNECTION
