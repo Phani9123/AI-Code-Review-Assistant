@@ -3,3 +3,7 @@ def authenticate(username, password, users):
         return True
 
     return False
+
+
+def test_change():
+    return True
