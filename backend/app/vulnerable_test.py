@@ -12,3 +12,7 @@ def get_user(username):
 def search_users(username):
     query = f"SELECT id, username FROM users WHERE username LIKE '%{username}%'"
     return execute(query)
+
+def delete_user(username):
+    query = f"DELETE FROM users WHERE username = '{username}'"
+    return execute(query)
