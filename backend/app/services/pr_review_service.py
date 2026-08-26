@@ -26,6 +26,7 @@ from backend.app.services.review_report_service import (
     build_review_report,
 )
 
+
 # ============================================================
 # SUPPORTED FILE TYPES
 # ============================================================
@@ -202,6 +203,7 @@ def normalize_bandit_findings(
 
     return findings
 
+
 # ============================================================
 # EXTRACT RUFF FIX
 # ============================================================
@@ -217,7 +219,10 @@ def _extract_ruff_fix(
     if not fix:
         return ""
 
+    # --------------------------------------------------------
     # Ruff may return a structured dictionary.
+    # --------------------------------------------------------
+
     if isinstance(
         fix,
         dict,
@@ -258,16 +263,20 @@ def _extract_ruff_fix(
 
                 if content:
                     return (
-                        f"Apply this change:\n\n"
-                        f"```python\n"
+                        "Apply this change:\n\n"
+                        "```python\n"
                         f"{content}\n"
-                        f"```"
+                        "```"
                     )
 
+    # --------------------------------------------------------
     # Fallback
+    # --------------------------------------------------------
+
     return str(
         fix
     ).strip()
+
 
 # ============================================================
 # NORMALIZE RUFF FINDINGS
@@ -351,8 +360,6 @@ def normalize_ruff_findings(
                         {},
                     )
                 ),
-
-
             }
         )
 
@@ -568,6 +575,7 @@ def analyze_pr_file(
     repository_name: str,
     pull_request_number: int,
     filename: str,
+    patch: str = "",
 ) -> dict:
     """
     Analyze one changed Python file from a Pull Request.
@@ -576,11 +584,13 @@ def analyze_pr_file(
 
         GitHub
           ↓
-        Source code
+        Full source code
           ↓
         Bandit
           ↓
         Ruff
+          ↓
+        PR patch
           ↓
         Semantic AI
           ↓
@@ -591,6 +601,11 @@ def analyze_pr_file(
         Deduplicate
           ↓
         Prioritize
+
+    Static tools receive the complete file.
+
+    The semantic AI reviewer receives only the GitHub
+    Pull Request patch.
     """
 
     print(
@@ -647,11 +662,32 @@ def analyze_pr_file(
         "\n========== RUNNING SEMANTIC ANALYSIS =========="
     )
 
-    semantic_report = (
-        review_code_semantically(
-            source_code
+    semantic_input = patch.strip()
+
+    if semantic_input:
+
+        print(
+            f"Semantic review input: "
+            f"PR patch ({len(semantic_input)} characters)"
         )
-    )
+
+        semantic_report = (
+            review_code_semantically(
+                semantic_input
+            )
+        )
+
+    else:
+
+        print(
+            "\nNo GitHub patch available. "
+            "Skipping semantic review."
+        )
+
+        semantic_report = {
+            "issues": [],
+            "error": "No PR patch available.",
+        }
 
     # ========================================================
     # AGGREGATE FINDINGS
@@ -806,6 +842,7 @@ def analyze_pr_file(
     return {
         "filename": filename,
         "source_code": source_code,
+        "patch": patch,
 
         "bandit": bandit_report,
 
@@ -904,12 +941,21 @@ def review_pull_request(
             "",
         )
 
+        patch = file.get(
+            "patch",
+            "",
+        ) or ""
+
         print(
             f"\nFile: {filename}"
         )
 
         print(
             f"Status: {status}"
+        )
+
+        print(
+            f"Patch length: {len(patch)} characters"
         )
 
         # ====================================================
@@ -954,6 +1000,7 @@ def review_pull_request(
             repository_name,
             pull_request_number,
             filename,
+            patch,
         )
 
         results.append(

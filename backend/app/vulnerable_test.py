@@ -5,5 +5,6 @@ def authenticate(username, password, users):
     return False
 
 
-def test_change():
-    return True
+def get_user(username):
+    query = f"SELECT * FROM users WHERE username = '{username}'"
+    return execute(query)

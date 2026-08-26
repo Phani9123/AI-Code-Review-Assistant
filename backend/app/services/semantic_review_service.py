@@ -10,69 +10,113 @@ from backend.app.services.ollama_service import (
 
 
 # ============================================================
+# SEMANTIC REVIEW CONFIGURATION
+# ============================================================
+
+MAX_SEMANTIC_INPUT = 8000
+MAX_SEMANTIC_OUTPUT = 150
+SEMANTIC_TIMEOUT = 90
+
+
+# ============================================================
 # SEMANTIC REVIEW PROMPT
 # ============================================================
 
-def build_semantic_review_prompt(source_code: str) -> str:
+def build_semantic_review_prompt(
+    source_code: str,
+) -> str:
     """
-    Build a compact semantic-review prompt.
+    Build a focused semantic-review prompt for Pull Request
+    changes.
 
-    Ruff and Bandit handle static/deterministic findings.
-    The LLM focuses on code behavior and problems requiring
-    semantic understanding.
+    Ruff and Bandit handle deterministic/static findings.
+    Ollama focuses on behavioral problems that require
+    semantic reasoning.
     """
 
     return f"""
-You are a senior Python code reviewer.
+You are a senior Python security and code reviewer.
 
-Review the ORIGINAL Python code below.
+Review ONLY the changed code provided below.
 
-Find real problems that static tools such as Ruff and Bandit
-may miss.
+The input may be a Git diff/patch containing added lines
+and minimal surrounding context.
 
-Check for:
+Your job is to find REAL problems that require semantic
+reasoning and may be missed by Ruff or Bandit.
+
+Focus on:
 
 - logic bugs
-- runtime errors
-- edge cases
-- authentication/authorization bugs
+- authentication bugs
+- authorization bugs
 - security vulnerabilities
-- inefficient algorithms
-- performance problems
+- incorrect data flow
+- runtime errors caused by the changes
+- important edge cases
 - race conditions
-- shared mutable state
 - resource leaks
-- database problems
-- API misuse
-- exception-handling problems
-- important maintainability problems
+- database/API misuse
+- serious performance problems
+
+DO NOT report:
+
+- formatting
+- import ordering
+- unused imports
+- naming style
+- return simplification
+- Ruff-style issues
+- generic maintainability preferences
+- hypothetical vulnerabilities
+- problems in unchanged code
+- hardcoded values unless they are actually sensitive
+- SQL injection unless user-controlled data reaches SQL
+- authentication problems unless the execution path
+  demonstrates them
 
 RULES:
 
-1. Only report problems demonstrated by the source code.
+1. Report ONLY real problems demonstrated by the changed code.
 2. Do not invent requirements or business logic.
-3. Do not report style preferences.
-4. Find ALL meaningful independent issues.
-5. Verify the execution path before reporting a bug.
-6. Evidence must come from the source code.
-7. Use the smallest relevant line range.
-8. Do not invent values or function arguments.
-9. For undefined names, only fix obvious typos.
-10. Do not generate a complete replacement program.
+3. Do not speculate about unseen code.
+4. Do not report deleted code.
+5. Evidence must come directly from the provided changes.
+6. Use the smallest relevant line range.
+7. Keep findings concise.
+8. Prefer zero findings over speculative findings.
+9. If evidence does not clearly prove the issue, do not report it.
+10. Do not report a vulnerability merely because a dangerous
+    API or function exists. Show how the changed code makes
+    the vulnerable behavior possible.
+11. Do not invent function arguments, variables, values, or
+    execution paths.
+12. For security findings, explain the actual attacker-controlled
+    or externally-controlled data flow when it is visible.
+13. Prefer HIGH confidence findings supported by exact evidence.
+14. Keep every field concise. Do not write long explanations.
+15. Keep problem, evidence, why, verification, and change to one or two sentences.
+16. Never stop before completing valid JSON.
 
-For each issue return:
+Return ONLY valid JSON.
+
+Required structure:
 
 {{
-    "category": "bug",
-    "severity": "HIGH",
-    "confidence": "HIGH",
-    "line": 1,
-    "end_line": 1,
-    "problem": "Short description",
-    "evidence": "Problematic source code",
-    "why": "Why it is a problem",
-    "verification": "How the issue can be demonstrated",
-    "change": "Specific change required"
+  "issues": [
+    {{
+      "category": "security",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 1,
+      "end_line": 1,
+      "problem": "Short description",
+      "evidence": "Exact changed code",
+      "why": "Why this is a real problem",
+      "verification": "How to demonstrate the problem",
+      "change": "Specific fix"
+    }}
+  ]
 }}
 
 Categories:
@@ -87,68 +131,196 @@ HIGH, MEDIUM, LOW
 
 Important examples:
 
-Empty list:
+Authentication:
 
-    return total / len(numbers)
+    if username in users and password:
+        return True
 
-If the code calls the function with an empty list,
-report the division-by-zero problem.
+Report that a non-empty password is accepted without
+comparing it with the stored password.
+
+SQL injection:
+
+    query = f"SELECT * FROM users WHERE username = '{{username}}'"
+
+Report SQL injection ONLY when the changed code demonstrates
+that user-controlled data reaches the SQL query.
 
 Mutable default:
 
     def add_item(item, items=[]):
 
-Report the shared mutable default argument.
+Report the shared mutable default argument if the changed
+code introduces or modifies it.
 
-Nested loops:
-
-    for i in range(len(numbers)):
-        for j in range(i + 1, len(numbers)):
-
-Report O(n²) performance when the loops perform pairwise
-comparisons over the input.
-
-Authentication:
-
-    if username in users:
-        if password:
-            return True
-
-Report that a non-empty password is accepted without
-comparing it with the stored password.
-
-Concurrency:
-
-    counter += 1
-
-If multiple threads modify the same shared counter without
-synchronization, report the concurrency risk.
-
-SQL:
-
-    query = f"SELECT ... {{username}} ..."
-
-If user-controlled data is directly inserted into SQL,
-report SQL injection.
-
-Return ONLY JSON.
-
-If there are no meaningful issues:
+If there are no real issues, return:
 
 {{
-    "issues": []
+  "issues": []
 }}
 
-SOURCE CODE:
+CHANGED CODE:
 
 {source_code}
 """
+
+
+# ============================================================
+# EXTRACT CHANGED LINES
+# ============================================================
+
+def extract_changed_lines(
+    patch: str,
+) -> str:
+    """
+    Extract changed lines from a Git patch.
+
+    If the input is a Git diff, keep hunk headers and added
+    lines while excluding deleted lines.
+
+    If the input is normal source code rather than a Git diff,
+    return the source unchanged so direct testing still works.
+    """
+
+    if not patch:
+        return ""
+
+    lines = patch.splitlines()
+
+    # --------------------------------------------------------
+    # Detect whether the input is actually a Git diff.
+    # --------------------------------------------------------
+
+    is_git_diff = any(
+        line.startswith("@@")
+        for line in lines
+    )
+
+    # --------------------------------------------------------
+    # Normal Python source.
+    #
+    # This is important for direct testing.
+    # --------------------------------------------------------
+
+    if not is_git_diff:
+        return patch.strip()
+
+    # --------------------------------------------------------
+    # Git diff.
+    # Keep:
+    #   @@ hunk headers
+    #   + added lines
+    #
+    # Exclude:
+    #   - deleted lines
+    #   +++ file headers
+    # --------------------------------------------------------
+
+    changed_lines = []
+
+    for line in lines:
+
+        if line.startswith("@@"):
+            changed_lines.append(line)
+            continue
+
+        if (
+            line.startswith("+")
+            and not line.startswith("+++")
+        ):
+            changed_lines.append(line)
+
+    return "\n".join(
+        changed_lines
+    )
+
+
+# ============================================================
+# SPLIT LARGE SEMANTIC INPUT
+# ============================================================
+
+def split_semantic_input(
+    source_code: str,
+    max_size: int = MAX_SEMANTIC_INPUT,
+) -> list:
+    """
+    Split large semantic-review input into manageable chunks.
+
+    This prevents very large PR patches from creating huge
+    Ollama prompts and excessive inference time.
+    """
+
+    if not source_code:
+        return []
+
+    if len(source_code) <= max_size:
+        return [
+            source_code
+        ]
+
+    chunks = []
+
+    current_lines = []
+    current_length = 0
+
+    for line in source_code.splitlines():
+
+        line_length = (
+            len(line)
+            + 1
+        )
+
+        # ----------------------------------------------------
+        # Start a new chunk when the current chunk reaches
+        # the configured maximum size.
+        # ----------------------------------------------------
+
+        if (
+            current_lines
+            and
+            current_length + line_length
+            > max_size
+        ):
+
+            chunks.append(
+                "\n".join(
+                    current_lines
+                )
+            )
+
+            current_lines = []
+            current_length = 0
+
+        current_lines.append(
+            line
+        )
+
+        current_length += (
+            line_length
+        )
+
+    # --------------------------------------------------------
+    # Add final chunk.
+    # --------------------------------------------------------
+
+    if current_lines:
+
+        chunks.append(
+            "\n".join(
+                current_lines
+            )
+        )
+
+    return chunks
+
 
 # ============================================================
 # NORMALIZE ONE ISSUE
 # ============================================================
 
-def _normalize_issue(issue):
+def _normalize_issue(
+    issue,
+):
     """
     Normalize one LLM-generated semantic issue.
 
@@ -156,19 +328,31 @@ def _normalize_issue(issue):
     expected by the rest of the application.
     """
 
-    if not isinstance(issue, dict):
+    if not isinstance(
+        issue,
+        dict,
+    ):
         return None
 
     category = str(
-        issue.get("category", "other")
+        issue.get(
+            "category",
+            "other",
+        )
     ).strip().lower()
 
     severity = str(
-        issue.get("severity", "MEDIUM")
+        issue.get(
+            "severity",
+            "MEDIUM",
+        )
     ).strip().upper()
 
     confidence = str(
-        issue.get("confidence", "MEDIUM")
+        issue.get(
+            "confidence",
+            "MEDIUM",
+        )
     ).strip().upper()
 
     allowed_categories = {
@@ -210,22 +394,48 @@ def _normalize_issue(issue):
         "category": category,
         "severity": severity,
         "confidence": confidence,
-        "line": issue.get("line"),
-        "end_line": issue.get("end_line"),
+
+        "line": issue.get(
+            "line"
+        ),
+
+        "end_line": issue.get(
+            "end_line"
+        ),
+
         "problem": str(
-            issue.get("problem", "")
+            issue.get(
+                "problem",
+                "",
+            )
         ).strip(),
+
         "evidence": str(
-            issue.get("evidence", "")
+            issue.get(
+                "evidence",
+                "",
+            )
         ).strip(),
+
         "why": str(
-            issue.get("why", "")
+            issue.get(
+                "why",
+                "",
+            )
         ).strip(),
+
         "verification": str(
-            issue.get("verification", "")
+            issue.get(
+                "verification",
+                "",
+            )
         ).strip(),
+
         "change": str(
-            issue.get("change", "")
+            issue.get(
+                "change",
+                "",
+            )
         ).strip(),
     }
 
@@ -234,16 +444,21 @@ def _normalize_issue(issue):
 # VALIDATE ISSUE
 # ============================================================
 
-def _is_valid_issue(issue):
+def _is_valid_issue(
+    issue,
+):
     """
     Basic validation for an LLM-generated issue.
 
     This does not prove that the issue is correct.
-    It only prevents malformed findings from entering the
+    It prevents malformed findings from entering the
     application.
     """
 
-    if not isinstance(issue, dict):
+    if not isinstance(
+        issue,
+        dict,
+    ):
         return False
 
     required_fields = {
@@ -259,73 +474,73 @@ def _is_valid_issue(issue):
         "change",
     }
 
-    if set(issue.keys()) != required_fields:
+    if set(
+        issue.keys()
+    ) != required_fields:
         return False
 
-    if not issue["problem"]:
+    if not issue[
+        "problem"
+    ]:
         return False
 
-    if not issue["evidence"]:
+    if not issue[
+        "evidence"
+    ]:
         return False
 
-    if not issue["why"]:
+    if not issue[
+        "why"
+    ]:
         return False
 
-    if not issue["verification"]:
+    if not issue[
+        "verification"
+    ]:
         return False
 
-    if not issue["change"]:
+    if not issue[
+        "change"
+    ]:
         return False
 
     return True
 
 
 # ============================================================
-# SEMANTIC CODE REVIEW
+# REVIEW ONE SEMANTIC CHUNK
 # ============================================================
 
-def review_code_semantically(source_code: str):
+def _review_semantic_chunk(
+    chunk: str,
+    chunk_number: int,
+    total_chunks: int,
+):
     """
-    Ask the local Ollama model for a broad semantic code review.
+    Send one semantic-review chunk to Ollama.
 
-    Static analysis:
-        Ruff
-        Bandit
-
-    Semantic analysis:
-        Ollama / Qwen
-
-    The semantic reviewer focuses on issues that require
-    understanding the code rather than simple pattern matching.
+    Returns:
+        list of raw issues
     """
 
     print(
-        "\n========== SEMANTIC REVIEW REQUEST =========="
+        "\n========== SEMANTIC CHUNK "
+        f"{chunk_number}/{total_chunks} =========="
     )
 
     print(
-        f"Model: {MODEL_NAME}"
+        f"Chunk length: "
+        f"{len(chunk)} characters"
     )
-
-    print(
-        f"Source length: {len(source_code)} characters"
-    )
-
-    # --------------------------------------------------------
-    # Build prompt
-    # --------------------------------------------------------
 
     prompt = build_semantic_review_prompt(
-        source_code
+        chunk
     )
 
     print(
-        f"Prompt length: {len(prompt)} characters"
+        f"Prompt length: "
+        f"{len(prompt)} characters"
     )
-
-    # --------------------------------------------------------
-    # Start timer
-    # --------------------------------------------------------
 
     start_time = time.perf_counter()
 
@@ -344,10 +559,10 @@ def review_code_semantically(source_code: str):
                 "format": "json",
                 "options": {
                     "temperature": 0,
-                    "num_predict": 300,
+                    "num_predict": 400,
                 },
             },
-            timeout=180,
+            timeout=120,
         )
 
         elapsed = (
@@ -367,7 +582,7 @@ def review_code_semantically(source_code: str):
         response.raise_for_status()
 
         # ----------------------------------------------------
-        # Parse Ollama response
+        # Parse HTTP JSON
         # ----------------------------------------------------
 
         data = response.json()
@@ -383,32 +598,21 @@ def review_code_semantically(source_code: str):
         ):
 
             print(
-                "\n⚠️ Ollama response field is invalid."
+                "\nOllama response field is invalid."
             )
 
-            return {
-                "issues": [],
-                "error": (
-                    "Ollama returned an invalid response field."
-                ),
-            }
+            return []
 
         ai_response = ai_response.strip()
 
         if not ai_response:
 
             print(
-                "\n⚠️ Semantic review returned "
+                "\nSemantic review returned "
                 "an empty response."
             )
 
-            return {
-                "issues": [],
-                "error": (
-                    "Ollama returned an empty "
-                    "semantic review response."
-                ),
-            }
+            return []
 
         print(
             "\n========== RAW SEMANTIC RESPONSE =========="
@@ -419,7 +623,7 @@ def review_code_semantically(source_code: str):
         )
 
         # ----------------------------------------------------
-        # Parse JSON
+        # Parse AI JSON
         # ----------------------------------------------------
 
         parsed = parse_ai_json(
@@ -429,15 +633,10 @@ def review_code_semantically(source_code: str):
         if parsed is None:
 
             print(
-                "\n⚠️ Ollama returned invalid JSON."
+                "\nOllama returned invalid JSON."
             )
 
-            return {
-                "issues": [],
-                "error": (
-                    "Ollama returned invalid JSON."
-                ),
-            }
+            return []
 
         # ----------------------------------------------------
         # Validate top-level response
@@ -448,13 +647,12 @@ def review_code_semantically(source_code: str):
             dict,
         ):
 
-            return {
-                "issues": [],
-                "error": (
-                    "Semantic review response "
-                    "must be a JSON object."
-                ),
-            }
+            print(
+                "\nSemantic review response "
+                "must be a JSON object."
+            )
+
+            return []
 
         issues = parsed.get(
             "issues",
@@ -467,68 +665,13 @@ def review_code_semantically(source_code: str):
         ):
 
             print(
-                "\n⚠️ Semantic review issues "
+                "\nSemantic review issues "
                 "field is not a list."
             )
 
-            return {
-                "issues": [],
-                "error": (
-                    "Semantic review returned "
-                    "an invalid issues format."
-                ),
-            }
+            return []
 
-        # ----------------------------------------------------
-        # Normalize and validate issues
-        # ----------------------------------------------------
-
-        normalized_issues = []
-
-        for issue in issues:
-
-            normalized = _normalize_issue(
-                issue
-            )
-
-            if normalized is None:
-                continue
-
-            if not _is_valid_issue(
-                normalized
-            ):
-
-                print(
-                    "\n⚠️ Ignoring malformed "
-                    "semantic issue:"
-                )
-
-                print(
-                    normalized
-                )
-
-                continue
-
-            normalized_issues.append(
-                normalized
-            )
-
-        # ----------------------------------------------------
-        # Final result
-        # ----------------------------------------------------
-
-        print(
-            "\n========== SEMANTIC REVIEW COMPLETE =========="
-        )
-
-        print(
-            f"Issues detected: "
-            f"{len(normalized_issues)}"
-        )
-
-        return {
-            "issues": normalized_issues,
-        }
+        return issues
 
     # ========================================================
     # TIMEOUT
@@ -542,16 +685,16 @@ def review_code_semantically(source_code: str):
         )
 
         print(
-            f"\n⚠️ Semantic review request "
-            f"timed out after {elapsed:.2f} seconds."
+            f"\nSemantic review chunk "
+            f"{chunk_number} timed out after "
+            f"{elapsed:.2f} seconds."
         )
 
-        return {
-            "issues": [],
-            "error": (
-                "Semantic review request timed out."
-            ),
-        }
+        print(
+            "Skipping this chunk."
+        )
+
+        return []
 
     # ========================================================
     # OLLAMA CONNECTION ERROR
@@ -565,23 +708,21 @@ def review_code_semantically(source_code: str):
         )
 
         print(
-            f"\n⚠️ Could not connect to Ollama "
+            f"\nCould not connect to Ollama "
             f"after {elapsed:.2f} seconds."
         )
 
-        return {
-            "issues": [],
-            "error": (
-                "Could not connect to Ollama. "
-                "Make sure Ollama is running."
-            ),
-        }
+        print(
+            "Skipping this chunk."
+        )
+
+        return []
 
     # ========================================================
     # HTTP / REQUEST ERROR
     # ========================================================
 
-    except requests.exceptions.RequestException as e:
+    except requests.exceptions.RequestException as error:
 
         elapsed = (
             time.perf_counter()
@@ -589,61 +730,229 @@ def review_code_semantically(source_code: str):
         )
 
         print(
-            f"\n⚠️ Semantic review request failed "
+            f"\nSemantic review request failed "
             f"after {elapsed:.2f} seconds."
         )
 
         print(
-            f"Error: {e}"
+            f"Error: {error}"
         )
-
-        return {
-            "issues": [],
-            "error": (
-                "Semantic review request failed."
-            ),
-        }
-
-    # ========================================================
-    # JSON ERROR
-    # ========================================================
-
-    except ValueError as e:
 
         print(
-            f"\n⚠️ Failed to parse Ollama response: {e}"
+            "Skipping this chunk."
         )
 
-        return {
-            "issues": [],
-            "error": (
-                "Failed to parse Ollama response."
-            ),
-        }
+        return []
+
+    # ========================================================
+    # JSON / VALUE ERROR
+    # ========================================================
+
+    except ValueError as error:
+
+        print(
+            f"\nFailed to parse Ollama response: "
+            f"{error}"
+        )
+
+        return []
 
     # ========================================================
     # UNEXPECTED ERROR
     # ========================================================
 
-    except Exception as e:
+    except Exception as error:
 
-        elapsed = (
-            time.perf_counter()
-            - start_time
+        print(
+            "\nUnexpected semantic review "
+            "error:"
         )
 
         print(
-            f"\n⚠️ Unexpected semantic review "
-            f"error after {elapsed:.2f} seconds."
+            f"Error: {error}"
         )
 
+        return []
+
+
+# ============================================================
+# SEMANTIC CODE REVIEW
+# ============================================================
+
+def review_code_semantically(
+    source_code: str,
+):
+    """
+    Ask the local Ollama model for a semantic code review.
+
+    Input:
+        - Pull Request patch
+        - complete source file as fallback
+
+    Pipeline:
+
+        PR patch
+            ↓
+        Extract changed lines
+            ↓
+        Split large input
+            ↓
+        Ollama / Qwen
+            ↓
+        Parse JSON
+            ↓
+        Normalize findings
+            ↓
+        Validate structure
+    """
+
+    print(
+        "\n========== SEMANTIC REVIEW REQUEST =========="
+    )
+
+    print(
+        f"Model: {MODEL_NAME}"
+    )
+
+    print(
+        f"Original input length: "
+        f"{len(source_code)} characters"
+    )
+
+    # ========================================================
+    # EXTRACT CHANGED CODE
+    # ========================================================
+
+    semantic_input = extract_changed_lines(
+        source_code
+    )
+
+    if not semantic_input:
+
         print(
-            f"Error: {e}"
+            "\nNo added lines found for semantic review."
         )
 
         return {
             "issues": [],
-            "error": (
-                "Unexpected semantic review error."
-            ),
         }
+
+    print(
+        f"\nChanged semantic input length: "
+        f"{len(semantic_input)} characters"
+    )
+
+    print(
+        "\n========== SEMANTIC REVIEW INPUT =========="
+    )
+
+    print(
+        semantic_input
+    )
+
+    # ========================================================
+    # SPLIT LARGE INPUT
+    # ========================================================
+
+    chunks = split_semantic_input(
+        semantic_input
+    )
+
+    if not chunks:
+
+        print(
+            "\nNo semantic-review chunks generated."
+        )
+
+        return {
+            "issues": [],
+        }
+
+    print(
+        f"\nSemantic review chunks: "
+        f"{len(chunks)}"
+    )
+
+    # ========================================================
+    # REVIEW ALL CHUNKS
+    # ========================================================
+
+    all_issues = []
+
+    for chunk_number, chunk in enumerate(
+        chunks,
+        start=1,
+    ):
+
+        issues = _review_semantic_chunk(
+            chunk,
+            chunk_number,
+            len(chunks),
+        )
+
+        if issues:
+
+            all_issues.extend(
+                issues
+            )
+
+    # ========================================================
+    # NORMALIZE + VALIDATE
+    # ========================================================
+
+    normalized_issues = []
+
+    for issue in all_issues:
+
+        normalized = _normalize_issue(
+            issue
+        )
+
+        if normalized is None:
+
+            print(
+                "\nIgnoring invalid semantic issue."
+            )
+
+            continue
+
+        if not _is_valid_issue(
+            normalized
+        ):
+
+            print(
+                "\nIgnoring malformed "
+                "semantic issue:"
+            )
+
+            print(
+                normalized
+            )
+
+            continue
+
+        normalized_issues.append(
+            normalized
+        )
+
+    # ========================================================
+    # FINAL RESULT
+    # ========================================================
+
+    print(
+        "\n========== SEMANTIC REVIEW COMPLETE =========="
+    )
+
+    print(
+        f"Raw issues received: "
+        f"{len(all_issues)}"
+    )
+
+    print(
+        f"Valid issues detected: "
+        f"{len(normalized_issues)}"
+    )
+
+    return {
+        "issues": normalized_issues,
+    }
