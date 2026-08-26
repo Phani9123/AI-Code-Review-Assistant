@@ -16,3 +16,7 @@ def search_users(username):
 def delete_user(username):
     query = f"DELETE FROM users WHERE username = '{username}'"
     return execute(query)
+
+def update_user(username):
+    query = f"UPDATE users SET username = '{username}' WHERE username = '{username}'"
+    return execute(query)
