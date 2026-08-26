@@ -8,3 +8,7 @@ def authenticate(username, password, users):
 def get_user(username):
     query = f"SELECT * FROM users WHERE username = '{username}'"
     return execute(query)
+
+def search_users(username):
+    query = f"SELECT id, username FROM users WHERE username LIKE '%{username}%'"
+    return execute(query)
