@@ -20,3 +20,7 @@ def delete_user(username):
 def update_user(username):
     query = f"UPDATE users SET username = '{username}' WHERE username = '{username}'"
     return execute(query)
+
+def find_user(email):
+    query = f"SELECT * FROM users WHERE email = '{email}'"
+    return execute(query)
