@@ -27,7 +27,9 @@ def post_pull_request_review(
         COMMENT
     """
 
-    print("\n========== GITHUB REVIEW POST ==========")
+    print(
+        "\n========== GITHUB REVIEW POST =========="
+    )
 
     print(
         f"Repository: {repository_name}"
@@ -64,11 +66,16 @@ def post_pull_request_review(
     # GET REPOSITORY
     # ========================================================
 
-    repository = get_github_repository(
+    repository = get_repository(
         repository_name
     )
 
     if repository is None:
+
+        print(
+            "\nCould not access GitHub repository."
+        )
+
         return {
             "success": False,
             "message": "Could not access GitHub repository",
@@ -92,7 +99,7 @@ def post_pull_request_review(
     )
 
     print(
-        "GitHub review successfully created."
+        "\nGitHub review successfully created."
     )
 
     print(

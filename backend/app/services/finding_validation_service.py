@@ -336,11 +336,49 @@ def validate_finding(
 # DEDUPLICATION KEY
 # ============================================================
 
+
+def _normalize_problem_text(
+    problem,
+):
+    """
+    Normalize problem text so semantically equivalent
+    static-analysis and AI findings can be compared.
+    """
+
+    text = str(
+        problem or ""
+    ).strip().lower()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text
+
+
 def _finding_key(
     finding,
 ):
     """
     Generate a file-aware deduplication key.
+
+    The key intentionally does NOT include the complete
+    problem description because different detection engines
+    may describe the same underlying issue differently.
+
+    Example:
+
+        Bandit:
+            Possible SQL injection vector through string-based
+            query construction.
+
+        Semantic:
+            SQL injection vulnerability
+
+    These should be considered the same issue when they
+    point to the same file, category and line.
     """
 
     filename = str(
@@ -361,24 +399,80 @@ def _finding_key(
         "line"
     )
 
-    problem = str(
-        finding.get(
-            "problem",
-            "",
-        )
-    ).strip().lower()
-
-    problem = re.sub(
-        r"\s+",
-        " ",
-        problem,
-    )
-
     return (
         filename,
         category,
         line,
-        problem,
+    )
+
+
+# ============================================================
+# DETERMINE FINDING STRENGTH
+# ============================================================
+
+def _finding_score(
+    finding,
+):
+    """
+    Calculate the strength of a finding.
+
+    Higher score means the finding should be preferred
+    when duplicate findings are detected.
+    """
+
+    severity_priority = {
+        "CRITICAL": 4,
+        "HIGH": 3,
+        "MEDIUM": 2,
+        "LOW": 1,
+    }
+
+    confidence_priority = {
+        "HIGH": 3,
+        "MEDIUM": 2,
+        "LOW": 1,
+    }
+
+    source_priority = {
+        "semantic": 3,
+        "bandit": 2,
+        "ruff": 1,
+    }
+
+    severity = str(
+        finding.get(
+            "severity",
+            "LOW",
+        )
+    ).upper()
+
+    confidence = str(
+        finding.get(
+            "confidence",
+            "LOW",
+        )
+    ).upper()
+
+    source = str(
+        finding.get(
+            "source",
+            "",
+        )
+    ).lower()
+
+    return (
+        severity_priority.get(
+            severity,
+            0,
+        ),
+        confidence_priority.get(
+            confidence,
+            0,
+        ),
+        source_priority.get(
+            source,
+            0,
+        ),
     )
 
 
@@ -392,15 +486,24 @@ def deduplicate_findings(
     """
     Remove duplicate findings.
 
-    If duplicate findings exist, keep the stronger
-    severity/confidence finding.
-    """
+    Findings are considered duplicates when they point to
+    the same file, category and source-code line.
 
-    confidence_priority = {
-        "HIGH": 3,
-        "MEDIUM": 2,
-        "LOW": 1,
-    }
+    When duplicates exist, the stronger finding is kept.
+
+    Priority:
+
+        1. Severity
+        2. Confidence
+        3. Detection source
+
+    Therefore, when Bandit and semantic analysis identify
+    the same security issue:
+
+        semantic HIGH/HIGH
+                beats
+        bandit MEDIUM/LOW
+    """
 
     selected = {}
 
@@ -420,46 +523,12 @@ def deduplicate_findings(
 
             continue
 
-        existing_score = (
-            SEVERITY_PRIORITY.get(
-                str(
-                    existing.get(
-                        "severity",
-                        "LOW",
-                    )
-                ).upper(),
-                0,
-            ),
-            confidence_priority.get(
-                str(
-                    existing.get(
-                        "confidence",
-                        "LOW",
-                    )
-                ).upper(),
-                0,
-            ),
+        existing_score = _finding_score(
+            existing
         )
 
-        current_score = (
-            SEVERITY_PRIORITY.get(
-                str(
-                    finding.get(
-                        "severity",
-                        "LOW",
-                    )
-                ).upper(),
-                0,
-            ),
-            confidence_priority.get(
-                str(
-                    finding.get(
-                        "confidence",
-                        "LOW",
-                    )
-                ).upper(),
-                0,
-            ),
+        current_score = _finding_score(
+            finding
         )
 
         if current_score > existing_score:
@@ -469,7 +538,6 @@ def deduplicate_findings(
     return list(
         selected.values()
     )
-
 
 # ============================================================
 # VALIDATE + DEDUPLICATE

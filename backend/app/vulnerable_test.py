@@ -24,3 +24,4 @@ def update_user(username):
 def find_user(email):
     query = f"SELECT * FROM users WHERE email = '{email}'"
     return execute(query)
+# Trigger automated PR review test

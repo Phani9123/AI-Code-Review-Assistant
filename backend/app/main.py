@@ -520,6 +520,7 @@ async def github_webhook(
             repository_name,
             pull_request_number,
             markdown,
+            status,
         )
 
     except Exception as error:
