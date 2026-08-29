@@ -25,6 +25,10 @@ def post_pull_request_review(
         APPROVE
         REQUEST_CHANGES
         COMMENT
+
+    If GitHub rejects REQUEST_CHANGES because the authenticated
+    user is the author of the pull request, automatically
+    fallback to COMMENT.
     """
 
     print(
@@ -93,10 +97,54 @@ def post_pull_request_review(
     # CREATE REVIEW
     # ========================================================
 
-    review = pull_request.create_review(
-        body=review_body,
-        event=event,
-    )
+    try:
+
+        review = pull_request.create_review(
+            body=review_body,
+            event=event,
+        )
+
+    except Exception as error:
+
+        error_message = str(
+            error
+        )
+
+        # ====================================================
+        # GITHUB DOES NOT ALLOW REQUEST_CHANGES ON YOUR
+        # OWN PULL REQUEST
+        # ====================================================
+
+        if (
+            event == "REQUEST_CHANGES"
+            and "Can not request changes on your own pull request"
+            in error_message
+        ):
+
+            print(
+                "\n⚠️ GitHub rejected REQUEST_CHANGES "
+                "because the authenticated user is the "
+                "pull request author."
+            )
+
+            print(
+                "Falling back to COMMENT..."
+            )
+
+            event = "COMMENT"
+
+            review = pull_request.create_review(
+                body=review_body,
+                event=event,
+            )
+
+        else:
+
+            raise
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
 
     print(
         "\nGitHub review successfully created."
@@ -108,6 +156,10 @@ def post_pull_request_review(
 
     print(
         f"Review state: {review.state}"
+    )
+
+    print(
+        f"GitHub event posted: {event}"
     )
 
     return {
