@@ -4,16 +4,46 @@ import time
 import requests
 
 from backend.app.services.ollama_service import (
-    OLLAMA_URL,
     MODEL_NAME,
+    OLLAMA_URL,
 )
-
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MAX_SEMANTIC_INPUT = 12000
+# Keep semantic chunks small enough for the local 7B model.
+MAX_SEMANTIC_INPUT = 3000
+
+# Local Ollama inference can be slow, but we don't want a
+# webhook waiting several minutes for one semantic chunk.
+OLLAMA_TIMEOUT = 90
+
+ALLOWED_CATEGORIES = {
+    "bug",
+    "security",
+    "performance",
+    "edge_case",
+    "concurrency",
+    "resource",
+    "database",
+    "maintainability",
+    "testing",
+    "other",
+}
+
+ALLOWED_SEVERITIES = {
+    "CRITICAL",
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+}
+
+ALLOWED_CONFIDENCES = {
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+}
 
 
 # ============================================================
@@ -24,8 +54,7 @@ def build_semantic_review_prompt(
     source_code: str,
 ) -> str:
     """
-    Build a focused semantic-review prompt for Pull Request
-    changes.
+    Build a compact semantic-review prompt.
 
     Ruff and Bandit handle deterministic/static findings.
     Ollama focuses on behavioral problems that require
@@ -35,24 +64,19 @@ def build_semantic_review_prompt(
     return f"""
 You are a senior Python security and code reviewer.
 
-Review ONLY the changed code provided below.
+Review ONLY the changed code below.
 
-The input is a Git Pull Request patch containing added
-lines and their REAL NEW-FILE LINE NUMBERS.
-
-Your job is to find REAL problems that require semantic
-reasoning and may be missed by Ruff or Bandit.
+Find ONLY real problems caused by the changed code.
 
 Focus on:
 
-- logic bugs
-- authentication bugs
-- authorization bugs
 - security vulnerabilities
+- logic bugs
+- authentication/authorization bugs
+- runtime errors
 - incorrect data flow
-- runtime errors caused by the changes
 - important edge cases
-- race conditions
+- concurrency problems
 - resource leaks
 - database/API misuse
 - serious performance problems
@@ -65,10 +89,11 @@ DO NOT report:
 - naming style
 - return simplification
 - Ruff-style issues
-- generic maintainability preferences
+- generic maintainability advice
 - hypothetical vulnerabilities
-- problems in unchanged code
-- hardcoded values unless they are actually sensitive
+- unchanged code
+- deleted code
+- hardcoded values unless actually sensitive
 - SQL injection unless user-controlled data reaches SQL
 - authentication problems unless the execution path
   demonstrates them
@@ -78,52 +103,30 @@ RULES:
 1. Report ONLY real problems demonstrated by the changed code.
 2. Do not invent requirements or business logic.
 3. Do not speculate about unseen code.
-4. Do not report deleted code.
-5. Evidence must come directly from the provided changes.
-6. Use the smallest relevant line range.
-7. Keep findings concise.
-8. Prefer zero findings over speculative findings.
-9. If evidence does not clearly prove the issue, do not report it.
-10. Do not report a vulnerability merely because a dangerous
-    API or function exists. Show how the changed code makes
-    the vulnerable behavior possible.
-11. Do not invent function arguments, variables, values, or
+4. Evidence must come directly from the provided changes.
+5. Use the smallest relevant line range.
+6. Keep findings concise.
+7. Prefer zero findings over speculative findings.
+8. If evidence does not clearly prove the issue, do not report it.
+9. Do not report a vulnerability merely because a dangerous
+   API or function exists. Show how the changed code makes
+   the vulnerable behavior possible.
+10. Do not invent function arguments, variables, values, or
     execution paths.
-12. For security findings, explain the actual attacker-controlled
-    or externally-controlled data flow when it is visible.
-13. Prefer HIGH confidence findings supported by exact evidence.
-14. Keep every field concise.
-15. Keep problem, evidence, why, verification, and change to
-    one or two sentences.
-16. Never stop before completing valid JSON.
-17. The line field MUST refer to the REAL SOURCE FILE LINE NUMBER
+11. For security findings, explain the actual attacker-controlled
+    or externally-controlled data flow when visible.
+12. Prefer HIGH confidence findings supported by exact evidence.
+13. Keep problem, evidence, why, verification, and change concise.
+14. The line field MUST refer to the REAL SOURCE FILE LINE NUMBER
     shown in the LINE prefix.
-18. Evidence MUST match the code on that source line.
-19. Do not report findings for context lines that are not added
-    lines.
+15. Evidence MUST match the code on that source line.
+16. Do not report findings for context lines that are not added.
+17. Return valid JSON only.
+18. Only report HIGH or MEDIUM confidence findings.
+19. Severity may be CRITICAL, HIGH, MEDIUM, or LOW.
+20. Category must be one of the allowed categories below.
 
-Return ONLY valid JSON.
-
-Required structure:
-
-{{
-  "issues": [
-    {{
-      "category": "security",
-      "severity": "HIGH",
-      "confidence": "HIGH",
-      "line": 13,
-      "end_line": 13,
-      "problem": "Short description",
-      "evidence": "Exact changed code",
-      "why": "Why this is a real problem",
-      "verification": "How to demonstrate the problem",
-      "change": "Specific fix"
-    }}
-  ]
-}}
-
-Categories:
+Allowed categories:
 
 bug
 security
@@ -136,42 +139,37 @@ maintainability
 testing
 other
 
-Severity:
+Allowed severity:
 
 CRITICAL
 HIGH
 MEDIUM
 LOW
 
-Confidence:
+Allowed confidence:
 
 HIGH
 MEDIUM
 LOW
 
-Important examples:
+Return exactly this structure:
 
-Authentication:
-
-    LINE 4: if username in users and password:
-    LINE 5:     return True
-
-Report that a non-empty password is accepted without
-comparing it with the stored password.
-
-SQL injection:
-
-    LINE 13: query = f"SELECT * FROM users WHERE username = '{{username}}'"
-
-Report SQL injection ONLY when the changed code demonstrates
-that user-controlled data reaches the SQL query.
-
-Mutable default:
-
-    LINE 10: def add_item(item, items=[]):
-
-Report the shared mutable default argument if the changed
-code introduces or modifies it.
+{{
+  "issues": [
+    {{
+      "category": "security",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line": 13,
+      "end_line": 13,
+      "problem": "Short description",
+      "evidence": "Exact changed code",
+      "why": "Why this is definitely a problem",
+      "verification": "How to verify",
+      "change": "Specific fix"
+    }}
+  ]
+}}
 
 If there are no real issues, return:
 
@@ -446,7 +444,7 @@ def _normalize_issue(
             "category",
             "other",
         )
-    ).upper()
+    ).lower()
 
     severity = str(
         issue.get(
@@ -463,7 +461,7 @@ def _normalize_issue(
     ).upper()
 
     return {
-        "category": category.lower(),
+        "category": category,
         "severity": severity,
         "confidence": confidence,
         "line": line,
@@ -548,6 +546,15 @@ def _is_valid_issue(
     ):
         return False
 
+    if issue["category"] not in ALLOWED_CATEGORIES:
+        return False
+
+    if issue["severity"] not in ALLOWED_SEVERITIES:
+        return False
+
+    if issue["confidence"] not in ALLOWED_CONFIDENCES:
+        return False
+
     if issue["line"] < 1:
         return False
 
@@ -557,10 +564,9 @@ def _is_valid_issue(
     if not issue["problem"]:
         return False
 
-    if not issue["evidence"]:
-        return False
-
-    return True
+    return bool(
+        issue["evidence"]
+    )
 
 
 # ============================================================
@@ -690,7 +696,7 @@ def _review_semantic_chunk(
                 "stream": False,
                 "format": "json",
             },
-            timeout=180,
+            timeout=OLLAMA_TIMEOUT,
         )
 
         elapsed = (
@@ -743,7 +749,12 @@ def _review_semantic_chunk(
         )
 
         print(
-            "Skipping this chunk."
+            "Semantic analysis failed for this chunk."
+        )
+
+        print(
+            "The timeout is NOT treated as "
+            "an empty successful review."
         )
 
         return []
@@ -761,7 +772,7 @@ def _review_semantic_chunk(
         )
 
         print(
-            "Skipping this chunk."
+            "Semantic analysis failed for this chunk."
         )
 
         return []
@@ -783,7 +794,23 @@ def _review_semantic_chunk(
         )
 
         print(
-            "Skipping this chunk."
+            "Semantic analysis failed for this chunk."
+        )
+
+        return []
+
+    except json.JSONDecodeError as error:
+
+        print(
+            "\nFailed to parse Ollama JSON response:"
+        )
+
+        print(
+            f"Error: {error}"
+        )
+
+        print(
+            "Semantic analysis failed for this chunk."
         )
 
         return []
@@ -797,7 +824,12 @@ def _review_semantic_chunk(
 
         return []
 
-    except Exception as error:
+    except (
+        KeyError,
+        TypeError,
+        AttributeError,
+        RuntimeError,
+    ) as error:
 
         print(
             "\nUnexpected semantic review "
@@ -832,6 +864,7 @@ def review_code_semantically(
         -> Parse JSON
         -> Normalize findings
         -> Validate structure
+        -> Filter low-confidence findings
     """
 
     print(
@@ -950,6 +983,29 @@ def review_code_semantically(
 
             print(
                 "\nIgnoring malformed "
+                "semantic issue:"
+            )
+
+            print(
+                normalized
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Only accept HIGH/MEDIUM confidence semantic findings.
+        #
+        # This prevents weak model guesses from becoming
+        # blocking or noisy review findings.
+        # ----------------------------------------------------
+
+        if normalized["confidence"] not in {
+            "HIGH",
+            "MEDIUM",
+        }:
+
+            print(
+                "\nIgnoring low-confidence "
                 "semantic issue:"
             )
 
