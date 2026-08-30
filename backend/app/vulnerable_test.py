@@ -39,3 +39,8 @@ def find_user(email):
 def get_account(username):
     query = f"SELECT * FROM accounts WHERE username = '{username}'"
     return execute(query)
+
+
+def find_account_by_email(email):
+    query = f"SELECT * FROM accounts WHERE email = '{email}'"
+    return execute(query)
