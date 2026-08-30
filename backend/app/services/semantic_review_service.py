@@ -15,10 +15,10 @@ from backend.app.services.ollama_service import (
 # Keep semantic chunks small enough for the local 7B model.
 MAX_SEMANTIC_INPUT = 3000
 
-# Local Ollama inference can be slow, but we don't want a
-# webhook waiting several minutes for one semantic chunk.
+# Maximum time allowed for one Ollama request.
 OLLAMA_TIMEOUT = 90
 
+# Only these categories are accepted from the model.
 ALLOWED_CATEGORIES = {
     "bug",
     "security",
@@ -32,6 +32,7 @@ ALLOWED_CATEGORIES = {
     "other",
 }
 
+# Only these severities are accepted.
 ALLOWED_SEVERITIES = {
     "CRITICAL",
     "HIGH",
@@ -39,6 +40,7 @@ ALLOWED_SEVERITIES = {
     "LOW",
 }
 
+# Only these confidence levels are accepted.
 ALLOWED_CONFIDENCES = {
     "HIGH",
     "MEDIUM",
@@ -54,7 +56,7 @@ def build_semantic_review_prompt(
     source_code: str,
 ) -> str:
     """
-    Build a compact semantic-review prompt.
+    Build a focused semantic-review prompt.
 
     Ruff and Bandit handle deterministic/static findings.
     Ollama focuses on behavioral problems that require
@@ -95,8 +97,7 @@ DO NOT report:
 - deleted code
 - hardcoded values unless actually sensitive
 - SQL injection unless user-controlled data reaches SQL
-- authentication problems unless the execution path
-  demonstrates them
+- authentication problems unless the execution path demonstrates them
 
 RULES:
 
@@ -109,8 +110,8 @@ RULES:
 7. Prefer zero findings over speculative findings.
 8. If evidence does not clearly prove the issue, do not report it.
 9. Do not report a vulnerability merely because a dangerous
-   API or function exists. Show how the changed code makes
-   the vulnerable behavior possible.
+   API or function exists. Show how the changed code makes the
+   vulnerable behavior possible.
 10. Do not invent function arguments, variables, values, or
     execution paths.
 11. For security findings, explain the actual attacker-controlled
@@ -125,6 +126,8 @@ RULES:
 18. Only report HIGH or MEDIUM confidence findings.
 19. Severity may be CRITICAL, HIGH, MEDIUM, or LOW.
 20. Category must be one of the allowed categories below.
+21. Do not report more than 10 findings.
+22. Do not report duplicate findings for the same issue.
 
 Allowed categories:
 
@@ -194,7 +197,7 @@ def extract_changed_lines(
     Extract added lines from a Git patch while preserving
     their actual line numbers in the new file.
 
-    Example Git hunk:
+    Example:
 
         @@ -7,4 +7,16 @@
          existing line
@@ -203,9 +206,6 @@ def extract_changed_lines(
     becomes:
 
         LINE 8: new line
-
-    This allows the semantic reviewer to report the real
-    source-code line number instead of a relative patch line.
 
     If normal source code is provided instead of a Git patch,
     return it unchanged.
@@ -312,7 +312,6 @@ def extract_changed_lines(
         # ----------------------------------------------------
 
         if line.startswith("-"):
-
             continue
 
         # ----------------------------------------------------
@@ -323,7 +322,6 @@ def extract_changed_lines(
         # ----------------------------------------------------
 
         if current_new_line is not None:
-
             current_new_line += 1
 
     return "\n".join(
@@ -361,15 +359,11 @@ def split_semantic_input(
 
     for line in source_code.splitlines():
 
-        line_length = (
-            len(line) + 1
-        )
+        line_length = len(line) + 1
 
         if (
             current_lines
-            and
-            current_length + line_length
-            > max_size
+            and current_length + line_length > max_size
         ):
 
             chunks.append(
@@ -418,7 +412,6 @@ def _normalize_issue(
         return None
 
     try:
-
         line = int(
             issue.get(
                 "line"
@@ -436,7 +429,6 @@ def _normalize_issue(
         TypeError,
         ValueError,
     ):
-
         return None
 
     category = str(
@@ -508,6 +500,9 @@ def _is_valid_issue(
 ) -> bool:
     """
     Validate the normalized semantic issue structure.
+
+    This is intentionally strict because model output should
+    never be trusted blindly.
     """
 
     if not isinstance(
@@ -534,6 +529,31 @@ def _is_valid_issue(
         if field not in issue:
             return False
 
+    # --------------------------------------------------------
+    # Validate category
+    # --------------------------------------------------------
+
+    if issue["category"] not in ALLOWED_CATEGORIES:
+        return False
+
+    # --------------------------------------------------------
+    # Validate severity
+    # --------------------------------------------------------
+
+    if issue["severity"] not in ALLOWED_SEVERITIES:
+        return False
+
+    # --------------------------------------------------------
+    # Validate confidence
+    # --------------------------------------------------------
+
+    if issue["confidence"] not in ALLOWED_CONFIDENCES:
+        return False
+
+    # --------------------------------------------------------
+    # Validate line numbers
+    # --------------------------------------------------------
+
     if not isinstance(
         issue["line"],
         int,
@@ -546,27 +566,29 @@ def _is_valid_issue(
     ):
         return False
 
-    if issue["category"] not in ALLOWED_CATEGORIES:
-        return False
-
-    if issue["severity"] not in ALLOWED_SEVERITIES:
-        return False
-
-    if issue["confidence"] not in ALLOWED_CONFIDENCES:
-        return False
-
     if issue["line"] < 1:
         return False
 
     if issue["end_line"] < issue["line"]:
         return False
 
+    # --------------------------------------------------------
+    # Validate required text
+    # --------------------------------------------------------
+
     if not issue["problem"]:
         return False
 
-    return bool(
-        issue["evidence"]
-    )
+    if not issue["evidence"]:
+        return False
+
+    if not issue["why"]:
+        return False
+
+    if not issue["verification"]:
+        return False
+
+    return bool(issue["change"])
 
 
 # ============================================================
@@ -594,18 +616,17 @@ def _parse_ollama_response(
     # Remove markdown code fences if the model added them.
     # --------------------------------------------------------
 
-    if text.startswith(
-        "```"
-    ):
+    if text.startswith("```"):
 
         lines = text.splitlines()
 
         if lines:
-
             lines = lines[1:]
 
-        if lines and lines[-1].strip() == "```":
-
+        if (
+            lines
+            and lines[-1].strip() == "```"
+        ):
             lines = lines[:-1]
 
         text = "\n".join(
@@ -624,7 +645,6 @@ def _parse_ollama_response(
         data,
         dict,
     ):
-
         return {
             "issues": []
         }
@@ -638,7 +658,6 @@ def _parse_ollama_response(
         issues,
         list,
     ):
-
         issues = []
 
     return {
@@ -667,8 +686,7 @@ def _review_semantic_chunk(
     )
 
     print(
-        f"Chunk length: "
-        f"{len(chunk)} characters"
+        f"Chunk length: {len(chunk)} characters"
     )
 
     prompt = build_semantic_review_prompt(
@@ -676,8 +694,7 @@ def _review_semantic_chunk(
     )
 
     print(
-        f"Prompt length: "
-        f"{len(prompt)} characters"
+        f"Prompt length: {len(prompt)} characters"
     )
 
     print(
@@ -752,11 +769,6 @@ def _review_semantic_chunk(
             "Semantic analysis failed for this chunk."
         )
 
-        print(
-            "The timeout is NOT treated as "
-            "an empty successful review."
-        )
-
         return []
 
     except requests.exceptions.ConnectionError:
@@ -815,25 +827,16 @@ def _review_semantic_chunk(
 
         return []
 
-    except ValueError as error:
-
-        print(
-            f"\nFailed to parse Ollama response: "
-            f"{error}"
-        )
-
-        return []
-
     except (
         KeyError,
         TypeError,
         AttributeError,
         RuntimeError,
+        ValueError,
     ) as error:
 
         print(
-            "\nUnexpected semantic review "
-            "error:"
+            "\nUnexpected semantic review error:"
         )
 
         print(
@@ -853,10 +856,8 @@ def review_code_semantically(
     """
     Ask the local Ollama model for a semantic code review.
 
-    Input:
-        Pull Request patch.
-
     Pipeline:
+
         PR patch
         -> Extract changed lines
         -> Split large input
@@ -865,6 +866,7 @@ def review_code_semantically(
         -> Normalize findings
         -> Validate structure
         -> Filter low-confidence findings
+        -> Return findings
     """
 
     print(
@@ -930,8 +932,7 @@ def review_code_semantically(
         }
 
     print(
-        f"\nSemantic review chunks: "
-        f"{len(chunks)}"
+        f"\nSemantic review chunks: {len(chunks)}"
     )
 
     # ========================================================
@@ -952,7 +953,6 @@ def review_code_semantically(
         )
 
         if issues:
-
             all_issues.extend(
                 issues
             )
@@ -982,8 +982,7 @@ def review_code_semantically(
         ):
 
             print(
-                "\nIgnoring malformed "
-                "semantic issue:"
+                "\nIgnoring malformed semantic issue:"
             )
 
             print(
@@ -993,10 +992,10 @@ def review_code_semantically(
             continue
 
         # ----------------------------------------------------
-        # Only accept HIGH/MEDIUM confidence semantic findings.
+        # Only accept HIGH/MEDIUM confidence findings.
         #
         # This prevents weak model guesses from becoming
-        # blocking or noisy review findings.
+        # noisy review findings.
         # ----------------------------------------------------
 
         if normalized["confidence"] not in {
@@ -1005,8 +1004,7 @@ def review_code_semantically(
         }:
 
             print(
-                "\nIgnoring low-confidence "
-                "semantic issue:"
+                "\nIgnoring low-confidence semantic issue:"
             )
 
             print(
@@ -1020,6 +1018,18 @@ def review_code_semantically(
         )
 
     # ========================================================
+    # LIMIT FINAL FINDINGS
+    # ========================================================
+
+    if len(normalized_issues) > 10:
+
+        print(
+            "\nLimiting semantic findings to 10."
+        )
+
+        normalized_issues = normalized_issues[:10]
+
+    # ========================================================
     # FINAL RESULT
     # ========================================================
 
@@ -1028,8 +1038,7 @@ def review_code_semantically(
     )
 
     print(
-        f"Raw issues received: "
-        f"{len(all_issues)}"
+        f"Raw issues received: {len(all_issues)}"
     )
 
     print(

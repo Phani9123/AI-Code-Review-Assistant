@@ -1,6 +1,5 @@
 import re
 
-
 # ============================================================
 # SEVERITY PRIORITY
 # ============================================================
@@ -14,10 +13,43 @@ SEVERITY_PRIORITY = {
 
 
 # ============================================================
+# ALLOWED FINDING VALUES
+# ============================================================
+
+ALLOWED_CATEGORIES = {
+    "bug",
+    "security",
+    "performance",
+    "edge_case",
+    "concurrency",
+    "resource",
+    "database",
+    "maintainability",
+    "testing",
+    "other",
+}
+
+ALLOWED_SEVERITIES = {
+    "CRITICAL",
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+}
+
+ALLOWED_CONFIDENCES = {
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+}
+
+
+# ============================================================
 # NORMALIZE TEXT
 # ============================================================
 
-def _normalize_text(value):
+def _normalize_text(
+    value,
+):
     """
     Normalize text before comparison.
     """
@@ -25,7 +57,9 @@ def _normalize_text(value):
     if value is None:
         return ""
 
-    text = str(value)
+    text = str(
+        value
+    )
 
     text = text.replace(
         "\r\n",
@@ -44,12 +78,14 @@ def _normalize_text(value):
 # NORMALIZE CODE
 # ============================================================
 
-def _normalize_code(value):
+def _normalize_code(
+    value,
+):
     """
     Normalize source/evidence code for comparison.
 
-    Removes insignificant whitespace differences
-    while preserving the important tokens.
+    Removes insignificant whitespace differences while
+    preserving important tokens.
     """
 
     text = _normalize_text(
@@ -123,10 +159,11 @@ def _get_reported_source(
 # EVIDENCE TOKEN EXTRACTION
 # ============================================================
 
-def _extract_meaningful_tokens(text):
+def _extract_meaningful_tokens(
+    text,
+):
     """
-    Extract meaningful identifiers and keywords
-    from semantic evidence.
+    Extract identifiers and keywords from evidence.
     """
 
     text = _normalize_text(
@@ -143,6 +180,64 @@ def _extract_meaningful_tokens(text):
 
 
 # ============================================================
+# MEANINGFUL SEMANTIC EVIDENCE
+# ============================================================
+
+def _evidence_is_meaningful(
+    evidence,
+):
+    """
+    Determine whether semantic evidence contains enough
+    actual code to support a finding.
+
+    A single identifier such as:
+
+        existing
+
+    is not meaningful evidence.
+
+    Examples of meaningful evidence:
+
+        existing = selected.get(key)
+
+        query = f"SELECT * FROM users WHERE id = '{user_id}'"
+    """
+
+    tokens = _extract_meaningful_tokens(
+        evidence
+    )
+
+    if not tokens:
+        return False
+
+    trivial_tokens = {
+        "if",
+        "else",
+        "elif",
+        "for",
+        "while",
+        "return",
+        "pass",
+        "continue",
+        "break",
+        "true",
+        "false",
+        "none",
+    }
+
+    meaningful_tokens = [
+        token
+        for token in tokens
+        if token.lower()
+        not in trivial_tokens
+    ]
+
+    return len(
+        meaningful_tokens
+    ) >= 2
+
+
+# ============================================================
 # EVIDENCE MATCHING
 # ============================================================
 
@@ -151,18 +246,24 @@ def evidence_matches_source(
     finding,
 ):
     """
-    Verify that semantic evidence is supported
-    by the reported source lines.
+    Verify that finding evidence is supported by the
+    reported source lines.
 
     Validation levels:
 
         1. Exact match
-        2. Normalized match
-        3. Meaningful token overlap
+        2. Normalized code match
 
-    Static findings may have empty evidence.
-    Those findings are accepted here because
-    Ruff/Bandit provide their own source information.
+    Token overlap is intentionally NOT accepted.
+
+    Why?
+
+    Evidence such as:
+
+        existing
+
+    can technically match the source while providing
+    no useful proof that a bug exists.
     """
 
     evidence = _normalize_text(
@@ -172,18 +273,52 @@ def evidence_matches_source(
         )
     )
 
+    source = str(
+        finding.get(
+            "source",
+            "",
+        )
+    ).lower()
+
     # --------------------------------------------------------
-    # Static findings may not contain evidence.
+    # Static findings
+    # --------------------------------------------------------
+
+    if source in {
+    "ruff",
+    "bandit",
+    } and not evidence:
+        return True
+
+    # --------------------------------------------------------
+    # Semantic findings require evidence
+    # --------------------------------------------------------
+
+    if source == "semantic":
+        if not evidence:
+            return False
+
+        if not _evidence_is_meaningful(
+            evidence
+        ):
+            return False
+
+    # --------------------------------------------------------
+    # Generic empty evidence
     # --------------------------------------------------------
 
     if not evidence:
-        return True
+        return False
 
     reported_source = _normalize_text(
         _get_reported_source(
             source_code,
-            finding.get("line"),
-            finding.get("end_line"),
+            finding.get(
+                "line"
+            ),
+            finding.get(
+                "end_line"
+            ),
         )
     )
 
@@ -209,39 +344,11 @@ def evidence_matches_source(
         reported_source
     )
 
-    if normalized_evidence in normalized_source:
-        return True
-
     # --------------------------------------------------------
-    # Token overlap
+    # No fuzzy token acceptance
     # --------------------------------------------------------
 
-    evidence_tokens = set(
-        _extract_meaningful_tokens(
-            evidence
-        )
-    )
-
-    source_tokens = set(
-        _extract_meaningful_tokens(
-            reported_source
-        )
-    )
-
-    if not evidence_tokens:
-        return False
-
-    matching_tokens = (
-        evidence_tokens
-        & source_tokens
-    )
-
-    overlap_ratio = (
-        len(matching_tokens)
-        / len(evidence_tokens)
-    )
-
-    return overlap_ratio >= 0.5
+    return normalized_evidence in normalized_source
 
 
 # ============================================================
@@ -274,7 +381,7 @@ def line_range_is_valid(
         end_line,
         int,
     ):
-        end_line = line
+        return False
 
     if line < 1:
         return False
@@ -287,8 +394,110 @@ def line_range_is_valid(
     if line > len(lines):
         return False
 
-    if end_line > len(lines):
+    return not end_line > len(lines)
+
+
+# ============================================================
+# SEMANTIC CLAIM VALIDATION
+# ============================================================
+
+def _semantic_finding_is_valid(
+    source_code,
+    finding,
+):
+    """
+    Additional conservative validation for semantic findings.
+
+    This does not attempt to prove every possible semantic bug.
+
+    It rejects common classes of obvious hallucinations.
+    """
+
+    problem = str(
+        finding.get(
+            "problem",
+            "",
+        )
+    ).strip().lower()
+
+    evidence = str(
+        finding.get(
+            "evidence",
+            "",
+        )
+    ).strip()
+
+    if not evidence:
         return False
+
+    if not _evidence_is_meaningful(
+        evidence
+    ):
+        return False
+
+    reported_source = _get_reported_source(
+        source_code,
+        finding.get(
+            "line"
+        ),
+        finding.get(
+            "end_line"
+        ),
+    )
+
+    if not reported_source:
+        return False
+
+    # --------------------------------------------------------
+    # Undefined variable claims
+    # --------------------------------------------------------
+
+    undefined_terms = {
+        "undefined",
+        "not defined",
+        "undefined variable",
+        "nameerror",
+    }
+
+    if (
+    any(
+        term in problem
+        for term in undefined_terms
+    )
+    and re.search(
+        r"\b[A-Za-z_][A-Za-z0-9_]*\s*=",
+        reported_source,
+    )
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # Malformed JSON / syntax claims
+    # --------------------------------------------------------
+
+    syntax_terms = {
+        "malformed json",
+        "invalid json",
+        "syntax error",
+        "invalid syntax",
+        "malformed dictionary",
+    }
+
+    if any(
+        term in problem
+        for term in syntax_terms
+    ):
+
+        stripped = reported_source.strip()
+
+        if (
+            stripped.startswith(
+                '"'
+            )
+            and ":"
+            in stripped
+        ):
+            return False
 
     return True
 
@@ -307,8 +516,12 @@ def validate_finding(
     Checks:
 
         1. Finding is a dictionary.
-        2. Reported line range exists.
-        3. Evidence is supported by the source.
+        2. Category is allowed.
+        3. Severity is allowed.
+        4. Confidence is allowed.
+        5. Reported line range exists.
+        6. Evidence is supported by the source.
+        7. Semantic findings pass additional safety checks.
     """
 
     if not isinstance(
@@ -317,11 +530,57 @@ def validate_finding(
     ):
         return False
 
+    # ========================================================
+    # NORMALIZE ENUMERATED VALUES
+    # ========================================================
+
+    category = str(
+        finding.get(
+            "category",
+            "other",
+        )
+    ).lower()
+
+    severity = str(
+        finding.get(
+            "severity",
+            "",
+        )
+    ).upper()
+
+    confidence = str(
+        finding.get(
+            "confidence",
+            "",
+        )
+    ).upper()
+
+    # ========================================================
+    # VALIDATE ENUMERATED VALUES
+    # ========================================================
+
+    if category not in ALLOWED_CATEGORIES:
+        return False
+
+    if severity not in ALLOWED_SEVERITIES:
+        return False
+
+    if confidence not in ALLOWED_CONFIDENCES:
+        return False
+
+    # ========================================================
+    # LINE RANGE
+    # ========================================================
+
     if not line_range_is_valid(
         source_code,
         finding,
     ):
         return False
+
+    # ========================================================
+    # EVIDENCE
+    # ========================================================
 
     if not evidence_matches_source(
         source_code,
@@ -329,34 +588,34 @@ def validate_finding(
     ):
         return False
 
-    return True
+    # ========================================================
+    # SOURCE
+    # ========================================================
+
+    source = str(
+        finding.get(
+            "source",
+            "",
+        )
+    ).lower()
+
+    # ========================================================
+    # SEMANTIC VALIDATION
+    # ========================================================
+
+    if (
+        source == "semantic"
+        and not _semantic_finding_is_valid(
+            source_code,
+            finding,
+        )
+    ):
+        return False
 
 
 # ============================================================
 # DEDUPLICATION KEY
 # ============================================================
-
-
-def _normalize_problem_text(
-    problem,
-):
-    """
-    Normalize problem text so semantically equivalent
-    static-analysis and AI findings can be compared.
-    """
-
-    text = str(
-        problem or ""
-    ).strip().lower()
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
-
-    return text
-
 
 def _finding_key(
     finding,
@@ -365,8 +624,9 @@ def _finding_key(
     Generate a file-aware deduplication key.
 
     The key intentionally does NOT include the complete
-    problem description because different detection engines
-    may describe the same underlying issue differently.
+    problem description.
+
+    Different engines can describe the same issue differently.
 
     Example:
 
@@ -375,10 +635,10 @@ def _finding_key(
             query construction.
 
         Semantic:
-            SQL injection vulnerability
+            SQL injection vulnerability.
 
-    These should be considered the same issue when they
-    point to the same file, category and line.
+    These should be treated as the same issue when they refer
+    to the same file/category/line.
     """
 
     filename = str(
@@ -407,17 +667,16 @@ def _finding_key(
 
 
 # ============================================================
-# DETERMINE FINDING STRENGTH
+# FINDING STRENGTH
 # ============================================================
 
 def _finding_score(
     finding,
 ):
     """
-    Calculate the strength of a finding.
+    Calculate finding strength.
 
-    Higher score means the finding should be preferred
-    when duplicate findings are detected.
+    Higher score wins when duplicate findings exist.
     """
 
     severity_priority = {
@@ -486,23 +745,21 @@ def deduplicate_findings(
     """
     Remove duplicate findings.
 
-    Findings are considered duplicates when they point to
-    the same file, category and source-code line.
+    Duplicate definition:
 
-    When duplicates exist, the stronger finding is kept.
+        same filename
+        +
+        same category
+        +
+        same line
+
+    Stronger finding wins.
 
     Priority:
 
         1. Severity
         2. Confidence
         3. Detection source
-
-    Therefore, when Bandit and semantic analysis identify
-    the same security issue:
-
-        semantic HIGH/HIGH
-                beats
-        bandit MEDIUM/LOW
     """
 
     selected = {}
@@ -539,6 +796,7 @@ def deduplicate_findings(
         selected.values()
     )
 
+
 # ============================================================
 # VALIDATE + DEDUPLICATE
 # ============================================================
@@ -550,15 +808,6 @@ def validate_and_deduplicate_findings(
 ):
     """
     Validate findings and remove duplicates.
-
-    IMPORTANT:
-    The argument order is:
-
-        findings,
-        source_code,
-        filename
-
-    This matches the test and is easier to read.
 
     Returns:
 
@@ -583,7 +832,6 @@ def validate_and_deduplicate_findings(
         findings,
         list,
     ):
-
         raise TypeError(
             "findings must be a list of finding dictionaries."
         )
@@ -592,7 +840,6 @@ def validate_and_deduplicate_findings(
         source_code,
         str,
     ):
-
         raise TypeError(
             "source_code must be a string."
         )
@@ -661,12 +908,17 @@ def validate_and_deduplicate_findings(
 
             print(
                 "\nRejected finding because "
-                "evidence or line range does "
-                "not match the reported source."
+                "evidence, line range, "
+                "enum validation, or "
+                "semantic validation failed."
+            )
+
+            print(
+                finding
             )
 
     # ========================================================
-    # COUNT BEFORE DEDUPLICATION
+    # BEFORE DEDUPLICATION
     # ========================================================
 
     before_deduplication = len(
@@ -684,7 +936,7 @@ def validate_and_deduplicate_findings(
     )
 
     # ========================================================
-    # COUNT AFTER DEDUPLICATION
+    # AFTER DEDUPLICATION
     # ========================================================
 
     after_deduplication = len(
@@ -702,17 +954,13 @@ def validate_and_deduplicate_findings(
 
     return {
         "findings": deduplicated_findings,
-
         "rejected": rejected_findings,
-
         "before_deduplication": (
             before_deduplication
         ),
-
         "after_deduplication": (
             after_deduplication
         ),
-
         "duplicates_removed": (
             duplicates_removed
         ),
