@@ -1,3 +1,4 @@
+import json
 import time
 
 import requests
@@ -5,17 +6,46 @@ import requests
 from backend.app.services.ollama_service import (
     MODEL_NAME,
     OLLAMA_URL,
-    parse_ai_json,
 )
 
-
 # ============================================================
-# SEMANTIC REVIEW CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
-MAX_SEMANTIC_INPUT = 8000
-MAX_SEMANTIC_OUTPUT = 150
-SEMANTIC_TIMEOUT = 90
+# Keep semantic chunks small enough for the local 7B model.
+MAX_SEMANTIC_INPUT = 3000
+
+# Maximum time allowed for one Ollama request.
+OLLAMA_TIMEOUT = 90
+
+# Only these categories are accepted from the model.
+ALLOWED_CATEGORIES = {
+    "bug",
+    "security",
+    "performance",
+    "edge_case",
+    "concurrency",
+    "resource",
+    "database",
+    "maintainability",
+    "testing",
+    "other",
+}
+
+# Only these severities are accepted.
+ALLOWED_SEVERITIES = {
+    "CRITICAL",
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+}
+
+# Only these confidence levels are accepted.
+ALLOWED_CONFIDENCES = {
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+}
 
 
 # ============================================================
@@ -26,8 +56,7 @@ def build_semantic_review_prompt(
     source_code: str,
 ) -> str:
     """
-    Build a focused semantic-review prompt for Pull Request
-    changes.
+    Build a focused semantic-review prompt.
 
     Ruff and Bandit handle deterministic/static findings.
     Ollama focuses on behavioral problems that require
@@ -37,24 +66,19 @@ def build_semantic_review_prompt(
     return f"""
 You are a senior Python security and code reviewer.
 
-Review ONLY the changed code provided below.
+Review ONLY the changed code below.
 
-The input may be a Git diff/patch containing added lines
-and minimal surrounding context.
-
-Your job is to find REAL problems that require semantic
-reasoning and may be missed by Ruff or Bandit.
+Find ONLY real problems caused by the changed code.
 
 Focus on:
 
-- logic bugs
-- authentication bugs
-- authorization bugs
 - security vulnerabilities
+- logic bugs
+- authentication/authorization bugs
+- runtime errors
 - incorrect data flow
-- runtime errors caused by the changes
 - important edge cases
-- race conditions
+- concurrency problems
 - resource leaks
 - database/API misuse
 - serious performance problems
@@ -67,40 +91,71 @@ DO NOT report:
 - naming style
 - return simplification
 - Ruff-style issues
-- generic maintainability preferences
+- generic maintainability advice
 - hypothetical vulnerabilities
-- problems in unchanged code
-- hardcoded values unless they are actually sensitive
+- unchanged code
+- deleted code
+- hardcoded values unless actually sensitive
 - SQL injection unless user-controlled data reaches SQL
-- authentication problems unless the execution path
-  demonstrates them
+- authentication problems unless the execution path demonstrates them
 
 RULES:
 
 1. Report ONLY real problems demonstrated by the changed code.
 2. Do not invent requirements or business logic.
 3. Do not speculate about unseen code.
-4. Do not report deleted code.
-5. Evidence must come directly from the provided changes.
-6. Use the smallest relevant line range.
-7. Keep findings concise.
-8. Prefer zero findings over speculative findings.
-9. If evidence does not clearly prove the issue, do not report it.
-10. Do not report a vulnerability merely because a dangerous
-    API or function exists. Show how the changed code makes
-    the vulnerable behavior possible.
-11. Do not invent function arguments, variables, values, or
+4. Evidence must come directly from the provided changes.
+5. Use the smallest relevant line range.
+6. Keep findings concise.
+7. Prefer zero findings over speculative findings.
+8. If evidence does not clearly prove the issue, do not report it.
+9. Do not report a vulnerability merely because a dangerous
+   API or function exists. Show how the changed code makes the
+   vulnerable behavior possible.
+10. Do not invent function arguments, variables, values, or
     execution paths.
-12. For security findings, explain the actual attacker-controlled
-    or externally-controlled data flow when it is visible.
-13. Prefer HIGH confidence findings supported by exact evidence.
-14. Keep every field concise. Do not write long explanations.
-15. Keep problem, evidence, why, verification, and change to one or two sentences.
-16. Never stop before completing valid JSON.
+11. For security findings, explain the actual attacker-controlled
+    or externally-controlled data flow when visible.
+12. Prefer HIGH confidence findings supported by exact evidence.
+13. Keep problem, evidence, why, verification, and change concise.
+14. The line field MUST refer to the REAL SOURCE FILE LINE NUMBER
+    shown in the LINE prefix.
+15. Evidence MUST match the code on that source line.
+16. Do not report findings for context lines that are not added.
+17. Return valid JSON only.
+18. Only report HIGH or MEDIUM confidence findings.
+19. Severity may be CRITICAL, HIGH, MEDIUM, or LOW.
+20. Category must be one of the allowed categories below.
+21. Do not report more than 10 findings.
+22. Do not report duplicate findings for the same issue.
 
-Return ONLY valid JSON.
+Allowed categories:
 
-Required structure:
+bug
+security
+performance
+edge_case
+concurrency
+resource
+database
+maintainability
+testing
+other
+
+Allowed severity:
+
+CRITICAL
+HIGH
+MEDIUM
+LOW
+
+Allowed confidence:
+
+HIGH
+MEDIUM
+LOW
+
+Return exactly this structure:
 
 {{
   "issues": [
@@ -108,50 +163,16 @@ Required structure:
       "category": "security",
       "severity": "HIGH",
       "confidence": "HIGH",
-      "line": 1,
-      "end_line": 1,
+      "line": 13,
+      "end_line": 13,
       "problem": "Short description",
       "evidence": "Exact changed code",
-      "why": "Why this is a real problem",
-      "verification": "How to demonstrate the problem",
+      "why": "Why this is definitely a problem",
+      "verification": "How to verify",
       "change": "Specific fix"
     }}
   ]
 }}
-
-Categories:
-bug, security, performance, edge_case, concurrency,
-resource, database, maintainability, testing, other
-
-Severity:
-CRITICAL, HIGH, MEDIUM, LOW
-
-Confidence:
-HIGH, MEDIUM, LOW
-
-Important examples:
-
-Authentication:
-
-    if username in users and password:
-        return True
-
-Report that a non-empty password is accepted without
-comparing it with the stored password.
-
-SQL injection:
-
-    query = f"SELECT * FROM users WHERE username = '{{username}}'"
-
-Report SQL injection ONLY when the changed code demonstrates
-that user-controlled data reaches the SQL query.
-
-Mutable default:
-
-    def add_item(item, items=[]):
-
-Report the shared mutable default argument if the changed
-code introduces or modifies it.
 
 If there are no real issues, return:
 
@@ -173,13 +194,21 @@ def extract_changed_lines(
     patch: str,
 ) -> str:
     """
-    Extract changed lines from a Git patch.
+    Extract added lines from a Git patch while preserving
+    their actual line numbers in the new file.
 
-    If the input is a Git diff, keep hunk headers and added
-    lines while excluding deleted lines.
+    Example:
 
-    If the input is normal source code rather than a Git diff,
-    return the source unchanged so direct testing still works.
+        @@ -7,4 +7,16 @@
+         existing line
+        +new line
+
+    becomes:
+
+        LINE 8: new line
+
+    If normal source code is provided instead of a Git patch,
+    return it unchanged.
     """
 
     if not patch:
@@ -188,7 +217,7 @@ def extract_changed_lines(
     lines = patch.splitlines()
 
     # --------------------------------------------------------
-    # Detect whether the input is actually a Git diff.
+    # Detect Git diff
     # --------------------------------------------------------
 
     is_git_diff = any(
@@ -197,38 +226,103 @@ def extract_changed_lines(
     )
 
     # --------------------------------------------------------
-    # Normal Python source.
-    #
-    # This is important for direct testing.
+    # Normal source code
     # --------------------------------------------------------
 
     if not is_git_diff:
         return patch.strip()
 
     # --------------------------------------------------------
-    # Git diff.
-    # Keep:
-    #   @@ hunk headers
-    #   + added lines
-    #
-    # Exclude:
-    #   - deleted lines
-    #   +++ file headers
+    # Parse Git diff
     # --------------------------------------------------------
 
     changed_lines = []
 
+    current_new_line = None
+
     for line in lines:
 
+        # ----------------------------------------------------
+        # Hunk header
+        #
+        # Example:
+        #
+        # @@ -7,4 +7,16 @@
+        # ----------------------------------------------------
+
         if line.startswith("@@"):
-            changed_lines.append(line)
+
+            try:
+                plus_part = line.split("+", 1)[1]
+                new_range = plus_part.split(" ", 1)[0]
+
+                new_start = new_range.split(",", 1)[0]
+
+                current_new_line = int(
+                    new_start
+                )
+
+            except (
+                ValueError,
+                IndexError,
+            ):
+                current_new_line = None
+
             continue
 
-        if (
-            line.startswith("+")
-            and not line.startswith("+++")
+        # ----------------------------------------------------
+        # Ignore diff metadata
+        # ----------------------------------------------------
+
+        if line.startswith(
+            (
+                "diff ",
+                "index ",
+                "---",
+                "+++",
+                "\\ No newline",
+            )
         ):
-            changed_lines.append(line)
+            continue
+
+        # ----------------------------------------------------
+        # Added line
+        # ----------------------------------------------------
+
+        if line.startswith("+"):
+
+            if current_new_line is not None:
+
+                code = line[1:]
+
+                changed_lines.append(
+                    f"LINE {current_new_line}: {code}"
+                )
+
+                current_new_line += 1
+
+            continue
+
+        # ----------------------------------------------------
+        # Deleted line
+        #
+        # Deleted lines do not exist in the new file,
+        # therefore they do not increment the new-file
+        # line number.
+        # ----------------------------------------------------
+
+        if line.startswith("-"):
+            continue
+
+        # ----------------------------------------------------
+        # Context line
+        #
+        # Context exists in both old and new files, so it
+        # advances the new-file line number.
+        # ----------------------------------------------------
+
+        if current_new_line is not None:
+            current_new_line += 1
 
     return "\n".join(
         changed_lines
@@ -265,21 +359,11 @@ def split_semantic_input(
 
     for line in source_code.splitlines():
 
-        line_length = (
-            len(line)
-            + 1
-        )
-
-        # ----------------------------------------------------
-        # Start a new chunk when the current chunk reaches
-        # the configured maximum size.
-        # ----------------------------------------------------
+        line_length = len(line) + 1
 
         if (
             current_lines
-            and
-            current_length + line_length
-            > max_size
+            and current_length + line_length > max_size
         ):
 
             chunks.append(
@@ -295,13 +379,7 @@ def split_semantic_input(
             line
         )
 
-        current_length += (
-            line_length
-        )
-
-    # --------------------------------------------------------
-    # Add final chunk.
-    # --------------------------------------------------------
+        current_length += line_length
 
     if current_lines:
 
@@ -322,10 +400,9 @@ def _normalize_issue(
     issue,
 ):
     """
-    Normalize one LLM-generated semantic issue.
+    Normalize one model-generated issue.
 
-    Removes unexpected fields and guarantees the structure
-    expected by the rest of the application.
+    Returns None when the structure is invalid.
     """
 
     if not isinstance(
@@ -334,103 +411,77 @@ def _normalize_issue(
     ):
         return None
 
+    try:
+        line = int(
+            issue.get(
+                "line"
+            )
+        )
+
+        end_line = int(
+            issue.get(
+                "end_line",
+                line,
+            )
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
     category = str(
         issue.get(
             "category",
             "other",
         )
-    ).strip().lower()
+    ).lower()
 
     severity = str(
         issue.get(
             "severity",
             "MEDIUM",
         )
-    ).strip().upper()
+    ).upper()
 
     confidence = str(
         issue.get(
             "confidence",
             "MEDIUM",
         )
-    ).strip().upper()
-
-    allowed_categories = {
-        "bug",
-        "security",
-        "performance",
-        "edge_case",
-        "concurrency",
-        "resource",
-        "database",
-        "maintainability",
-        "testing",
-        "other",
-    }
-
-    allowed_severities = {
-        "CRITICAL",
-        "HIGH",
-        "MEDIUM",
-        "LOW",
-    }
-
-    allowed_confidence = {
-        "HIGH",
-        "MEDIUM",
-        "LOW",
-    }
-
-    if category not in allowed_categories:
-        category = "other"
-
-    if severity not in allowed_severities:
-        severity = "MEDIUM"
-
-    if confidence not in allowed_confidence:
-        confidence = "MEDIUM"
+    ).upper()
 
     return {
         "category": category,
         "severity": severity,
         "confidence": confidence,
-
-        "line": issue.get(
-            "line"
-        ),
-
-        "end_line": issue.get(
-            "end_line"
-        ),
-
+        "line": line,
+        "end_line": end_line,
         "problem": str(
             issue.get(
                 "problem",
                 "",
             )
         ).strip(),
-
         "evidence": str(
             issue.get(
                 "evidence",
                 "",
             )
         ).strip(),
-
         "why": str(
             issue.get(
                 "why",
                 "",
             )
         ).strip(),
-
         "verification": str(
             issue.get(
                 "verification",
                 "",
             )
         ).strip(),
-
         "change": str(
             issue.get(
                 "change",
@@ -441,18 +492,17 @@ def _normalize_issue(
 
 
 # ============================================================
-# VALIDATE ISSUE
+# VALIDATE ONE ISSUE
 # ============================================================
 
 def _is_valid_issue(
     issue,
-):
+) -> bool:
     """
-    Basic validation for an LLM-generated issue.
+    Validate the normalized semantic issue structure.
 
-    This does not prove that the issue is correct.
-    It prevents malformed findings from entering the
-    application.
+    This is intentionally strict because model output should
+    never be trusted blindly.
     """
 
     if not isinstance(
@@ -461,7 +511,7 @@ def _is_valid_issue(
     ):
         return False
 
-    required_fields = {
+    required_fields = [
         "category",
         "severity",
         "confidence",
@@ -472,39 +522,147 @@ def _is_valid_issue(
         "why",
         "verification",
         "change",
+    ]
+
+    for field in required_fields:
+
+        if field not in issue:
+            return False
+
+    # --------------------------------------------------------
+    # Validate category
+    # --------------------------------------------------------
+
+    if issue["category"] not in ALLOWED_CATEGORIES:
+        return False
+
+    # --------------------------------------------------------
+    # Validate severity
+    # --------------------------------------------------------
+
+    if issue["severity"] not in ALLOWED_SEVERITIES:
+        return False
+
+    # --------------------------------------------------------
+    # Validate confidence
+    # --------------------------------------------------------
+
+    if issue["confidence"] not in ALLOWED_CONFIDENCES:
+        return False
+
+    # --------------------------------------------------------
+    # Validate line numbers
+    # --------------------------------------------------------
+
+    if not isinstance(
+        issue["line"],
+        int,
+    ):
+        return False
+
+    if not isinstance(
+        issue["end_line"],
+        int,
+    ):
+        return False
+
+    if issue["line"] < 1:
+        return False
+
+    if issue["end_line"] < issue["line"]:
+        return False
+
+    # --------------------------------------------------------
+    # Validate required text
+    # --------------------------------------------------------
+
+    if not issue["problem"]:
+        return False
+
+    if not issue["evidence"]:
+        return False
+
+    if not issue["why"]:
+        return False
+
+    if not issue["verification"]:
+        return False
+
+    return bool(issue["change"])
+
+
+# ============================================================
+# PARSE OLLAMA JSON
+# ============================================================
+
+def _parse_ollama_response(
+    response_text: str,
+):
+    """
+    Parse JSON returned by Ollama.
+
+    The model is instructed to return JSON only, but this
+    function also handles common markdown-fenced responses.
+    """
+
+    if not response_text:
+        return {
+            "issues": []
+        }
+
+    text = response_text.strip()
+
+    # --------------------------------------------------------
+    # Remove markdown code fences if the model added them.
+    # --------------------------------------------------------
+
+    if text.startswith("```"):
+
+        lines = text.splitlines()
+
+        if lines:
+            lines = lines[1:]
+
+        if (
+            lines
+            and lines[-1].strip() == "```"
+        ):
+            lines = lines[:-1]
+
+        text = "\n".join(
+            lines
+        ).strip()
+
+    # --------------------------------------------------------
+    # Parse JSON
+    # --------------------------------------------------------
+
+    data = json.loads(
+        text
+    )
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return {
+            "issues": []
+        }
+
+    issues = data.get(
+        "issues",
+        [],
+    )
+
+    if not isinstance(
+        issues,
+        list,
+    ):
+        issues = []
+
+    return {
+        "issues": issues
     }
-
-    if set(
-        issue.keys()
-    ) != required_fields:
-        return False
-
-    if not issue[
-        "problem"
-    ]:
-        return False
-
-    if not issue[
-        "evidence"
-    ]:
-        return False
-
-    if not issue[
-        "why"
-    ]:
-        return False
-
-    if not issue[
-        "verification"
-    ]:
-        return False
-
-    if not issue[
-        "change"
-    ]:
-        return False
-
-    return True
 
 
 # ============================================================
@@ -519,8 +677,7 @@ def _review_semantic_chunk(
     """
     Send one semantic-review chunk to Ollama.
 
-    Returns:
-        list of raw issues
+    Returns a list of raw issues.
     """
 
     print(
@@ -529,8 +686,7 @@ def _review_semantic_chunk(
     )
 
     print(
-        f"Chunk length: "
-        f"{len(chunk)} characters"
+        f"Chunk length: {len(chunk)} characters"
     )
 
     prompt = build_semantic_review_prompt(
@@ -538,17 +694,16 @@ def _review_semantic_chunk(
     )
 
     print(
-        f"Prompt length: "
-        f"{len(prompt)} characters"
+        f"Prompt length: {len(prompt)} characters"
+    )
+
+    print(
+        "\n========== SENDING REQUEST TO OLLAMA =========="
     )
 
     start_time = time.perf_counter()
 
     try:
-
-        print(
-            "\n========== SENDING REQUEST TO OLLAMA =========="
-        )
 
         response = requests.post(
             OLLAMA_URL,
@@ -557,12 +712,8 @@ def _review_semantic_chunk(
                 "prompt": prompt,
                 "stream": False,
                 "format": "json",
-                "options": {
-                    "temperature": 0,
-                    "num_predict": 400,
-                },
             },
-            timeout=120,
+            timeout=OLLAMA_TIMEOUT,
         )
 
         elapsed = (
@@ -570,112 +721,36 @@ def _review_semantic_chunk(
             - start_time
         )
 
-        print(
-            f"\nOllama response received in "
-            f"{elapsed:.2f} seconds."
-        )
-
-        # ----------------------------------------------------
-        # HTTP validation
-        # ----------------------------------------------------
-
         response.raise_for_status()
 
-        # ----------------------------------------------------
-        # Parse HTTP JSON
-        # ----------------------------------------------------
+        print(
+            f"\nOllama response received "
+            f"in {elapsed:.2f} seconds."
+        )
 
-        data = response.json()
+        response_data = response.json()
 
-        ai_response = data.get(
+        response_text = response_data.get(
             "response",
             "",
         )
-
-        if not isinstance(
-            ai_response,
-            str,
-        ):
-
-            print(
-                "\nOllama response field is invalid."
-            )
-
-            return []
-
-        ai_response = ai_response.strip()
-
-        if not ai_response:
-
-            print(
-                "\nSemantic review returned "
-                "an empty response."
-            )
-
-            return []
 
         print(
             "\n========== RAW SEMANTIC RESPONSE =========="
         )
 
         print(
-            ai_response
+            response_text
         )
 
-        # ----------------------------------------------------
-        # Parse AI JSON
-        # ----------------------------------------------------
-
-        parsed = parse_ai_json(
-            ai_response
+        parsed = _parse_ollama_response(
+            response_text
         )
 
-        if parsed is None:
-
-            print(
-                "\nOllama returned invalid JSON."
-            )
-
-            return []
-
-        # ----------------------------------------------------
-        # Validate top-level response
-        # ----------------------------------------------------
-
-        if not isinstance(
-            parsed,
-            dict,
-        ):
-
-            print(
-                "\nSemantic review response "
-                "must be a JSON object."
-            )
-
-            return []
-
-        issues = parsed.get(
+        return parsed.get(
             "issues",
             [],
         )
-
-        if not isinstance(
-            issues,
-            list,
-        ):
-
-            print(
-                "\nSemantic review issues "
-                "field is not a list."
-            )
-
-            return []
-
-        return issues
-
-    # ========================================================
-    # TIMEOUT
-    # ========================================================
 
     except requests.exceptions.Timeout:
 
@@ -691,14 +766,10 @@ def _review_semantic_chunk(
         )
 
         print(
-            "Skipping this chunk."
+            "Semantic analysis failed for this chunk."
         )
 
         return []
-
-    # ========================================================
-    # OLLAMA CONNECTION ERROR
-    # ========================================================
 
     except requests.exceptions.ConnectionError:
 
@@ -713,14 +784,10 @@ def _review_semantic_chunk(
         )
 
         print(
-            "Skipping this chunk."
+            "Semantic analysis failed for this chunk."
         )
 
         return []
-
-    # ========================================================
-    # HTTP / REQUEST ERROR
-    # ========================================================
 
     except requests.exceptions.RequestException as error:
 
@@ -739,33 +806,37 @@ def _review_semantic_chunk(
         )
 
         print(
-            "Skipping this chunk."
+            "Semantic analysis failed for this chunk."
         )
 
         return []
 
-    # ========================================================
-    # JSON / VALUE ERROR
-    # ========================================================
-
-    except ValueError as error:
+    except json.JSONDecodeError as error:
 
         print(
-            f"\nFailed to parse Ollama response: "
-            f"{error}"
+            "\nFailed to parse Ollama JSON response:"
+        )
+
+        print(
+            f"Error: {error}"
+        )
+
+        print(
+            "Semantic analysis failed for this chunk."
         )
 
         return []
 
-    # ========================================================
-    # UNEXPECTED ERROR
-    # ========================================================
-
-    except Exception as error:
+    except (
+        KeyError,
+        TypeError,
+        AttributeError,
+        RuntimeError,
+        ValueError,
+    ) as error:
 
         print(
-            "\nUnexpected semantic review "
-            "error:"
+            "\nUnexpected semantic review error:"
         )
 
         print(
@@ -785,25 +856,17 @@ def review_code_semantically(
     """
     Ask the local Ollama model for a semantic code review.
 
-    Input:
-        - Pull Request patch
-        - complete source file as fallback
-
     Pipeline:
 
         PR patch
-            ↓
-        Extract changed lines
-            ↓
-        Split large input
-            ↓
-        Ollama / Qwen
-            ↓
-        Parse JSON
-            ↓
-        Normalize findings
-            ↓
-        Validate structure
+        -> Extract changed lines
+        -> Split large input
+        -> Ollama / Qwen
+        -> Parse JSON
+        -> Normalize findings
+        -> Validate structure
+        -> Filter low-confidence findings
+        -> Return findings
     """
 
     print(
@@ -869,8 +932,7 @@ def review_code_semantically(
         }
 
     print(
-        f"\nSemantic review chunks: "
-        f"{len(chunks)}"
+        f"\nSemantic review chunks: {len(chunks)}"
     )
 
     # ========================================================
@@ -891,7 +953,6 @@ def review_code_semantically(
         )
 
         if issues:
-
             all_issues.extend(
                 issues
             )
@@ -921,8 +982,29 @@ def review_code_semantically(
         ):
 
             print(
-                "\nIgnoring malformed "
-                "semantic issue:"
+                "\nIgnoring malformed semantic issue:"
+            )
+
+            print(
+                normalized
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Only accept HIGH/MEDIUM confidence findings.
+        #
+        # This prevents weak model guesses from becoming
+        # noisy review findings.
+        # ----------------------------------------------------
+
+        if normalized["confidence"] not in {
+            "HIGH",
+            "MEDIUM",
+        }:
+
+            print(
+                "\nIgnoring low-confidence semantic issue:"
             )
 
             print(
@@ -936,6 +1018,18 @@ def review_code_semantically(
         )
 
     # ========================================================
+    # LIMIT FINAL FINDINGS
+    # ========================================================
+
+    if len(normalized_issues) > 10:
+
+        print(
+            "\nLimiting semantic findings to 10."
+        )
+
+        normalized_issues = normalized_issues[:10]
+
+    # ========================================================
     # FINAL RESULT
     # ========================================================
 
@@ -944,8 +1038,7 @@ def review_code_semantically(
     )
 
     print(
-        f"Raw issues received: "
-        f"{len(all_issues)}"
+        f"Raw issues received: {len(all_issues)}"
     )
 
     print(
