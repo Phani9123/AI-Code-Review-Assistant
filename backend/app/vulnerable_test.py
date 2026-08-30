@@ -35,3 +35,7 @@ def find_user(email):
 # webhook synchronization test
 
 # semantic timeout test
+
+def get_account(username):
+    query = f"SELECT * FROM accounts WHERE username = '{username}'"
+    return execute(query)
